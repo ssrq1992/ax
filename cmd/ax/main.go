@@ -99,6 +99,24 @@ func main() {
 
 	// Commands that don't require an AX server connection
 	switch cmd {
+	case "convert-kagent":
+		if err := runConvertKagent(cleanArgs, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	case "convert-workerpools":
+		if err := runConvertWorkerPools(cleanArgs, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	case "group":
+		if err := runGroup(explicitServer, atespace, cleanArgs, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	case "version":
 		fmt.Println("ax version v1alpha1 (standalone redis engine)")
 		return
@@ -185,6 +203,9 @@ Available Commands:
   delete model <name>     Delete a model
   ctx, context            Show active Kubernetes context and AX connection
   tunnel <list|stop>      Manage background tunnels to Kubernetes clusters
+  convert-kagent        Convert kagent source resources or Helm values for AX
+  convert-workerpools    Convert WorkerPool installation YAML to TaskGroups and AX platform profiles
+  group <create|get|list|scale|delete>  Manage TaskGroups using mTLS (explicit --server)
   version                 Print AX version
 
 Flags:
@@ -400,7 +421,6 @@ func runGet(serverURL, atespace string, args []string) error {
 		return yaml.NewEncoder(os.Stdout).Encode(task)
 	}
 
-
 	if (resource == "workspaces" || resource == "workspace") && len(args) == 1 {
 		resp, err := client.ListWorkspaces(ctx, &v1alpha1.ListWorkspacesRequest{Atespace: atespace})
 		if err != nil {
@@ -606,7 +626,6 @@ func runDescribe(serverURL, atespace string, args []string) error {
 		}
 		return nil
 	}
-
 
 	task, err := client.GetTask(ctx, &v1alpha1.GetTaskRequest{Atespace: atespace, Name: name})
 	if err != nil {

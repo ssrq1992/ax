@@ -39,6 +39,7 @@ func clone[T proto.Message](m T) T {
 
 // MemoryStore is an in-memory implementation of store.Store for testing and single-node setups.
 type MemoryStore struct {
+	managed    map[string]store.ManagedRecords
 	mu         sync.RWMutex
 	tasks      map[string]*v1alpha1.Task
 	models     map[string]*v1alpha1.Model

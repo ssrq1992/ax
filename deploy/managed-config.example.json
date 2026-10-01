@@ -1,0 +1,22 @@
+{
+  "clients": {
+    "spiffe://example.test/kagent/controller": ["kagent"]
+  },
+  "poolProfiles": {
+    "gvisor": {
+      "workerImage": "REPLACE_WITH_PINNED_WORKER_IMAGE"
+    }
+  },
+  "sandboxConfigs": {
+    "gvisor": "gvisor-default",
+    "microvm": "microvm"
+  },
+  "guestImage": "REPLACE_WITH_AX_GUEST_IMAGE_AT_SHA256_DIGEST",
+  "callbackURL": "https://kagent-controller.kagent:8083",
+  "router": {
+    "endpoint": "REPLACE_WITH_VERIFIED_TLS_ROUTER_ENDPOINT",
+    "authority": "REPLACE_WITH_ROUTER_CERTIFICATE_DNS_NAME",
+    "caFile": "/run/servicedns-ca/trust-bundle.pem",
+    "tokenFile": "/var/run/secrets/ateapi/token"
+  }
+}

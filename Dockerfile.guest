@@ -1,0 +1,16 @@
+FROM --platform=$BUILDPLATFORM golang:1.27.1 AS build
+ARG TARGETOS=linux
+ARG TARGETARCH
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ax-sandbox-guest/ cmd/ax-sandbox-guest/
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -o /ax-sandbox-guest ./cmd/ax-sandbox-guest
+FROM alpine:3.24
+RUN apk add --no-cache ca-certificates && mkdir -p /data/workspace /data/guest-logs && chown -R 65532:65532 /data
+COPY --from=build /ax-sandbox-guest /usr/local/bin/ax-sandbox-guest
+USER 65532:65532
+WORKDIR /data/workspace
+EXPOSE 80
+ENTRYPOINT ["/usr/local/bin/ax-sandbox-guest"]
+CMD ["--listen=:80", "--workspace=/data/workspace", "--log-dir=/data/guest-logs"]

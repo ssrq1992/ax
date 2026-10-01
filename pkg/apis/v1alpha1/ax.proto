@@ -36,6 +36,21 @@ service AX {
   rpc WatchTask(WatchTaskRequest) returns (stream WatchTaskResponse);
 
 
+  // Managed runtime resources. Existing ungrouped Task behavior is unchanged.
+  rpc CreateTaskGroup(CreateTaskGroupRequest) returns (TaskGroup);
+  rpc GetTaskGroup(GetTaskGroupRequest) returns (TaskGroup);
+  rpc ListTaskGroups(ListTaskGroupsRequest) returns (ListTaskGroupsResponse);
+  rpc UpdateTaskGroup(UpdateTaskGroupRequest) returns (TaskGroup);
+  rpc DeleteTaskGroup(DeleteTaskGroupRequest) returns (DeleteTaskGroupResponse);
+  rpc PrepareRuntime(PrepareRuntimeRequest) returns (PreparedRuntime);
+  rpc GetPreparedRuntime(GetPreparedRuntimeRequest) returns (PreparedRuntime);
+  rpc ReleasePreparedRuntime(ReleasePreparedRuntimeRequest) returns (ReleasePreparedRuntimeResponse);
+  rpc PauseTask(PauseTaskRequest) returns (Task);
+  rpc CreateTaskCheckpoint(CreateTaskCheckpointRequest) returns (TaskCheckpoint);
+  rpc GetTaskCheckpoint(GetTaskCheckpointRequest) returns (TaskCheckpoint);
+  rpc DeleteTaskCheckpoint(DeleteTaskCheckpointRequest) returns (DeleteTaskCheckpointResponse);
+  rpc AuthenticateRuntime(AuthenticateRuntimeRequest) returns (AuthenticateRuntimeResponse);
+
   // Workspaces
   rpc GetWorkspace(GetWorkspaceRequest) returns (Workspace);
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
@@ -55,6 +70,8 @@ message ObjectMeta {
   string name = 1;
   string atespace = 2;
   google.protobuf.Timestamp creation_timestamp = 3;
+  string uid = 4;
+  uint64 resource_version = 5;
 }
 
 // --- Task ---
@@ -78,6 +95,9 @@ message TaskSpec {
   // debug enables the in-container guest services (process execution and file
   // access) that back `ax ssh`. Off by default.
   bool debug = 6;
+  ResourceRef group_ref = 7;
+  ResourceRef prepared_runtime_ref = 8;
+  ResourceRef restore_from = 9;
 }
 
 message EnvVar {
@@ -110,6 +130,7 @@ message TaskStatus {
   PendingApproval pending_approval = 5;
   UsageStats usage = 6;
   repeated Condition conditions = 7;
+  TaskRuntimeStatus runtime_status = 8;
 }
 
 message PendingApproval {
@@ -223,12 +244,16 @@ message SecretKeyRef {
 message GetTaskRequest {
   string atespace = 1;
   string name = 2;
+  bool refresh_runtime = 3;
 }
 
 message ListTasksRequest {
   string atespace = 1;
   int64 limit = 2;
   int64 offset = 3;
+  // Lists only managed Tasks. Requires an explicit atespace and managed mTLS.
+  // The default retains ordinary Task listing behavior.
+  bool managed_only = 4;
 }
 
 message ListTasksResponse {
@@ -237,11 +262,14 @@ message ListTasksResponse {
 
 message CreateTaskRequest {
   Task task = 1;
+  string request_id = 2;
 }
 
 message DeleteTaskRequest {
   string atespace = 1;
   string name = 2;
+  string expected_uid = 3;
+  string operation_id = 4;
 }
 
 message DeleteTaskResponse {}
@@ -249,11 +277,15 @@ message DeleteTaskResponse {}
 message SuspendTaskRequest {
   string atespace = 1;
   string name = 2;
+  string expected_uid = 3;
+  string operation_id = 4;
 }
 
 message ResumeTaskRequest {
   string atespace = 1;
   string name = 2;
+  string expected_uid = 3;
+  string operation_id = 4;
 }
 
 message WatchTaskRequest {
@@ -316,3 +348,63 @@ message DeleteModelRequest {
 
 message DeleteModelResponse {}
 
+
+// References are AX identities, never backend resource addresses.
+message ResourceRef { string atespace = 1; string name = 2; string uid = 3; }
+message TaskGroup {
+  string api_version = 1; string kind = 2; ObjectMeta metadata = 3;
+  TaskGroupSpec spec = 4; TaskGroupStatus status = 5;
+}
+message TaskGroupSpec {
+  optional int32 replicas = 1;
+  string sandbox_class = 2;
+  string snapshot_location = 3;
+}
+message TaskGroupStatus { string phase = 1; int32 ready_workers = 2; string message = 3; }
+message CreateTaskGroupRequest { TaskGroup group = 1; string request_id = 2; }
+message GetTaskGroupRequest { string atespace = 1; string name = 2; }
+message ListTaskGroupsRequest { string atespace = 1; int32 page_size = 2; string page_token = 3; }
+message ListTaskGroupsResponse { repeated TaskGroup groups = 1; string next_page_token = 2; }
+message UpdateTaskGroupRequest { ResourceRef ref = 1; uint64 expected_version = 2; int32 replicas = 3; }
+message DeleteTaskGroupRequest { ResourceRef ref = 1; string operation_id = 2; }
+message DeleteTaskGroupResponse {}
+
+message Readiness { string path = 1; int32 port = 2; int32 timeout_seconds = 3; }
+message CredentialSecretRef { string namespace = 1; string name = 2; string key = 3; }
+message EgressCredential {
+  string hostname = 1; string header = 2; string prefix = 3; CredentialSecretRef secret_key_ref = 4;
+}
+message EgressSpec { repeated string destinations = 1; repeated EgressCredential credentials = 2; }
+message PreparedRuntimeSpec {
+  ResourceRef group_ref = 1;
+  // Service or Sandbox; no arbitrary backend fields are accepted.
+  string kind = 2;
+  string image = 3; repeated string command = 4; repeated string args = 5;
+  repeated EnvVar env = 6; ResourceReqs resources = 7; Readiness readiness = 8;
+  EgressSpec egress = 9; string snapshot_location_override = 10;
+}
+message PreparedRuntime {
+  ObjectMeta metadata = 1; PreparedRuntimeSpec spec = 2;
+  string digest = 3; string phase = 4; string message = 5;
+}
+message PrepareRuntimeRequest { ObjectMeta metadata = 1; PreparedRuntimeSpec spec = 2; string request_id = 3; }
+message GetPreparedRuntimeRequest { ResourceRef ref = 1; }
+message ReleasePreparedRuntimeRequest { ResourceRef ref = 1; string operation_id = 2; }
+message ReleasePreparedRuntimeResponse {}
+message TaskRuntimeStatus {
+  string phase = 1; uint64 execution_version = 2; string last_operation_id = 3;
+  string boundary_ref = 4; bool restorable = 5; string message = 6;
+}
+message PauseTaskRequest { ResourceRef ref = 1; string operation_id = 2; }
+message TaskCheckpoint {
+  ObjectMeta metadata = 1; ResourceRef source_task = 2; ResourceRef runtime_ref = 3;
+  ResourceRef group_ref = 4; string phase = 5; string boundary_ref = 6; string message = 7;
+}
+message CreateTaskCheckpointRequest {
+  string name = 1; ResourceRef task_ref = 2; string expected_boundary_ref = 3; string request_id = 4;
+}
+message GetTaskCheckpointRequest { ResourceRef ref = 1; }
+message DeleteTaskCheckpointRequest { ResourceRef ref = 1; string operation_id = 2; }
+message DeleteTaskCheckpointResponse {}
+message AuthenticateRuntimeRequest { string credential = 1; string atespace = 2; }
+message AuthenticateRuntimeResponse { ResourceRef task_ref = 1; repeated string scopes = 2; }

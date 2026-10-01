@@ -1,0 +1,59 @@
+syntax = "proto3";
+package ax.v1alpha1;
+option go_package = "github.com/google/ax/pkg/apis/v1alpha1";
+import "ax.proto";
+import "google/protobuf/timestamp.proto";
+
+// Stable AX execution API. Guest protocol translation is private to AX.
+service TaskExecutionService {
+ rpc StartProcess(StartProcessRequest) returns (StartProcessResponse);
+ rpc GetProcess(GetProcessRequest) returns (Process);
+ rpc KillProcess(KillProcessRequest) returns (KillProcessResponse);
+ rpc StreamProcessOutputs(StreamProcessOutputsRequest) returns (stream OutputChunk);
+ rpc ReadFile(ReadFileRequest) returns (stream FileChunk);
+ rpc WriteFile(stream WriteFileRequest) returns (WriteFileResponse);
+}
+enum ProcessStatus {
+ PROCESS_STATUS_UNSPECIFIED = 0;
+ PROCESS_STATUS_RUNNING = 1;
+ PROCESS_STATUS_COMPLETED = 2;
+ PROCESS_STATUS_FAILED = 3;
+ PROCESS_STATUS_TERMINATED = 4;
+}
+enum OutputSource {
+ OUTPUT_SOURCE_UNSPECIFIED = 0;
+ OUTPUT_SOURCE_STDOUT = 1;
+ OUTPUT_SOURCE_STDERR = 2;
+}
+message Process {
+ string process_id = 1;
+ ProcessStatus status = 2;
+ int32 exit_code = 3;
+ google.protobuf.Timestamp started_at = 4;
+ google.protobuf.Timestamp finished_at = 5;
+ repeated string command = 6;
+}
+message StartProcessRequest {
+ ResourceRef task_ref = 1;
+ repeated string command = 2;
+ string cwd = 3;
+ map<string,string> env = 4;
+ int64 timeout_ms = 5;
+}
+message StartProcessResponse { string process_id = 1; }
+message GetProcessRequest { ResourceRef task_ref = 1; string process_id = 2; }
+// Kills the process group with SIGKILL, including child processes.
+message KillProcessRequest { ResourceRef task_ref = 1; string process_id = 2; }
+message KillProcessResponse { int32 exit_code = 1; }
+message StreamProcessOutputsRequest {
+ ResourceRef task_ref = 1;
+ string process_id = 2;
+ int64 stdout_offset = 3;
+ int64 stderr_offset = 4;
+ bool follow = 5;
+}
+message OutputChunk { OutputSource source = 1; bytes data = 2; int64 next_offset = 3; Process exit = 4; }
+message ReadFileRequest { ResourceRef task_ref = 1; string path = 2; }
+message FileChunk { bytes data = 1; }
+message WriteFileRequest { ResourceRef task_ref = 1; string path = 2; bytes chunk = 3; uint32 mode = 4; }
+message WriteFileResponse { int64 bytes_written = 1; }

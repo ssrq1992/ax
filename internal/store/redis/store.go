@@ -35,8 +35,9 @@ var (
 
 // Options contains configuration for the Redis store.
 type Options struct {
-	KeyPrefix string
-	TTL       time.Duration // Optional TTL for task records
+	ManagedEpoch string // Required by managed server deployments; external recovery anchor.
+	KeyPrefix    string
+	TTL          time.Duration // Optional TTL for task records
 }
 
 // Store is a Redis-backed implementation of store.Store.
@@ -59,7 +60,6 @@ func NewStore(client *redis.Client, opts Options) *Store {
 func (s *Store) taskKey(atespace, name string) string {
 	return fmt.Sprintf("%s:task:%s:%s", s.opts.KeyPrefix, atespace, name)
 }
-
 
 func (s *Store) modelKey(atespace, name string) string {
 	return fmt.Sprintf("%s:model:%s:%s", s.opts.KeyPrefix, atespace, name)
@@ -265,7 +265,6 @@ func (s *Store) DeleteTask(ctx context.Context, atespace, name string) error {
 	}
 	return nil
 }
-
 
 // SaveModel stores a model.
 func (s *Store) SaveModel(ctx context.Context, model *v1alpha1.Model) error {

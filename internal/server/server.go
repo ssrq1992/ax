@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/lock"
 	"github.com/google/ax/internal/store"
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -37,13 +38,23 @@ type Reconciler interface {
 }
 
 // Options configures the AX API Server.
+type RuntimeDialer func(context.Context, *v1alpha1.Task) (context.Context, grpc.ClientConnInterface, error)
+
 type Options struct {
-	Locker     lock.Locker
-	Reconciler Reconciler
+	ManagedReady   func(context.Context) error
+	RuntimeDialer  RuntimeDialer
+	Managed        *controller.ManagedController
+	ManagedClients map[string][]string
+	Locker         lock.Locker
+	Reconciler     Reconciler
 }
 
 // Server provides the gRPC API for AX.
 type Server struct {
+	managedReady   func(context.Context) error
+	runtimeDialer  RuntimeDialer
+	managed        *controller.ManagedController
+	managedClients map[string][]string
 	v1alpha1.UnimplementedAXServer
 	store      store.Store
 	locker     lock.Locker
@@ -63,12 +74,22 @@ func NewServer(s store.Store, opts ...Options) *Server {
 	}
 
 	srv := &Server{
-		store:      s,
-		locker:     locker,
-		reconciler: opt.Reconciler,
-		grpcServer: grpc.NewServer(),
+		managedReady:   opt.ManagedReady,
+		runtimeDialer:  opt.RuntimeDialer,
+		managed:        opt.Managed,
+		managedClients: opt.ManagedClients,
+		store:          s,
+		locker:         locker,
+		reconciler:     opt.Reconciler,
+		grpcServer:     grpc.NewServer(),
+	}
+	if opt.Managed != nil {
+		srv.grpcServer = grpc.NewServer(grpc.ForceServerCodec(gatewayCodec{}), grpc.UnknownServiceHandler(srv.gateway))
 	}
 	v1alpha1.RegisterAXServer(srv.grpcServer, srv)
+	if opt.Managed != nil {
+		v1alpha1.RegisterTaskExecutionServiceServer(srv.grpcServer, &executionServer{server: srv})
+	}
 	return srv
 }
 
@@ -81,7 +102,25 @@ func (s *Server) GRPCServer() *grpc.Server {
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+			if r.TLS != nil {
+				r = r.WithContext(context.WithValue(r.Context(), managedTLSKey{}, r.TLS))
+			}
 			s.grpcServer.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/readyz" {
+			if s.managed != nil {
+				if s.managedReady == nil {
+					http.Error(w, "managed readiness is not configured", http.StatusServiceUnavailable)
+					return
+				}
+				if err := s.managedReady(r.Context()); err != nil {
+					http.Error(w, "managed ledger unavailable", http.StatusServiceUnavailable)
+					return
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
 			return
 		}
 		if r.URL.Path == "/healthz" {
@@ -105,6 +144,14 @@ func (s *Server) GetTask(ctx context.Context, req *v1alpha1.GetTaskRequest) (*v1
 	if atespace == "" {
 		atespace = "default"
 	}
+	if managed, err := s.managedTask(ctx, atespace, req.Name); err != nil {
+		return nil, err
+	} else if managed {
+		if req.RefreshRuntime {
+			return s.managed.RefreshTask(ctx, atespace, req.Name)
+		}
+		return s.managed.GetTask(ctx, atespace, req.Name)
+	}
 	task, err := s.store.GetTask(ctx, atespace, req.Name)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -116,6 +163,12 @@ func (s *Server) GetTask(ctx context.Context, req *v1alpha1.GetTaskRequest) (*v1
 }
 
 func (s *Server) ListTasks(ctx context.Context, req *v1alpha1.ListTasksRequest) (*v1alpha1.ListTasksResponse, error) {
+	if req.GetManagedOnly() {
+		if err := s.authorizeManaged(ctx, req.Atespace); err != nil {
+			return nil, err
+		}
+		return s.managed.ListTasks(ctx, req)
+	}
 	atespace := ""
 	limit := int64(50)
 	offset := int64(0)
@@ -140,6 +193,37 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 		return nil, status.Error(codes.InvalidArgument, "task required")
 	}
 	task := req.Task
+	space := task.GetMetadata().GetAtespace()
+	if space == "" {
+		space = "default"
+	}
+	// Shared name reservation also serializes ordinary versus managed creation.
+	if err := v1alpha1.ValidateObjectMeta(task.Metadata); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	unlock, err := s.locker.Lock(ctx, "task", space, task.Metadata.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Aborted, "locking task: %v", err)
+	}
+	defer unlock()
+	owns, err := s.managedTask(ctx, space, task.GetMetadata().GetName())
+	if err != nil {
+		return nil, err
+	}
+	managedSpec := task.GetSpec().GetGroupRef() != nil || task.GetSpec().GetPreparedRuntimeRef() != nil || task.GetSpec().GetRestoreFrom() != nil
+	if owns || managedSpec {
+		if err := s.authorizeManaged(ctx, space); err != nil {
+			return nil, err
+		}
+		if !owns {
+			if _, err := s.store.GetTask(ctx, space, task.GetMetadata().GetName()); err == nil {
+				return nil, status.Error(codes.AlreadyExists, "ordinary Task already owns this name")
+			} else if !errors.Is(err, store.ErrNotFound) {
+				return nil, err
+			}
+		}
+		return s.managed.CreateTask(ctx, req)
+	}
 	if err := v1alpha1.ValidateTask(task); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -152,13 +236,6 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 		task.Metadata.Atespace = atespace
 	}
 	taskName := task.Metadata.GetName()
-
-	// Acquire exclusive lock for this task
-	unlock, err := s.locker.Lock(ctx, "task", atespace, taskName)
-	if err != nil {
-		return nil, status.Errorf(codes.Aborted, "locking task %s/%s: %v", atespace, taskName, err)
-	}
-	defer unlock()
 
 	_, err = s.store.GetTask(ctx, atespace, taskName)
 	if err == nil {
@@ -205,6 +282,15 @@ func (s *Server) DeleteTask(ctx context.Context, req *v1alpha1.DeleteTaskRequest
 	atespace := req.Atespace
 	if atespace == "" {
 		atespace = "default"
+	}
+	if managed, err := s.managedTask(ctx, atespace, req.Name); err != nil {
+		return nil, err
+	} else if managed {
+		_, err := s.managed.Transition(ctx, &v1alpha1.ResourceRef{Atespace: atespace, Name: req.Name, Uid: req.ExpectedUid}, req.OperationId, "Delete")
+		if err != nil {
+			return nil, err
+		}
+		return &v1alpha1.DeleteTaskResponse{}, nil
 	}
 	taskName := req.Name
 
@@ -262,6 +348,11 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 	if atespace == "" {
 		atespace = "default"
 	}
+	if managed, err := s.managedTask(ctx, atespace, req.Name); err != nil {
+		return nil, err
+	} else if managed {
+		return s.managed.Transition(ctx, &v1alpha1.ResourceRef{Atespace: atespace, Name: req.Name, Uid: req.ExpectedUid}, req.OperationId, "Suspend")
+	}
 	taskName := req.Name
 
 	// Acquire exclusive lock for this task
@@ -309,6 +400,11 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 	atespace := req.Atespace
 	if atespace == "" {
 		atespace = "default"
+	}
+	if managed, err := s.managedTask(ctx, atespace, req.Name); err != nil {
+		return nil, err
+	} else if managed {
+		return s.managed.Transition(ctx, &v1alpha1.ResourceRef{Atespace: atespace, Name: req.Name, Uid: req.ExpectedUid}, req.OperationId, "Resume")
 	}
 	taskName := req.Name
 
@@ -377,6 +473,11 @@ func (s *Server) WatchTask(req *v1alpha1.WatchTaskRequest, stream grpc.ServerStr
 		atespace = "default"
 	}
 	ctx := stream.Context()
+	if managed, err := s.managedTask(ctx, atespace, req.Name); err != nil {
+		return err
+	} else if managed {
+		return s.watchManaged(req, stream)
+	}
 	ch, closer, err := s.store.WatchTask(ctx, atespace, req.Name)
 	if err != nil {
 		return status.Errorf(codes.Internal, "watching task: %v", err)
@@ -599,4 +700,3 @@ func defaultMetadata(meta *v1alpha1.ObjectMeta, existing func(atespace, name str
 	}
 	return meta
 }
-

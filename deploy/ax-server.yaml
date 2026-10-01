@@ -30,7 +30,10 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["ate.dev"]
+    resources: ["workerpools"]
+    verbs: ["get", "create", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -70,6 +73,12 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - "--addr=:8080"
+            - "--managed-addr=:8443"
+            - "--managed-config=/run/ax-managed/managed.json"
+            - "--managed-ledger-epoch=$(AX_MANAGED_LEDGER_EPOCH)"
+            - "--tls-cert-file=/run/ax-tls/tls.crt"
+            - "--tls-key-file=/run/ax-tls/tls.key"
+            - "--tls-client-ca-file=/run/ax-client-ca/ca.crt"
             - "--redis-addr=ax-redis.ax-system.svc.cluster.local:6379"
             - "--substrate-endpoint=api.ate-system.svc.cluster.local:443"
             - "--substrate-authority=api.ate-system.svc"
@@ -78,11 +87,21 @@ spec:
             - "--template=default-template"
             - "--template-atespace=ax-system"
           env:
+            - name: AX_MANAGED_LEDGER_EPOCH
+              valueFrom:
+                configMapKeyRef:
+                  name: ax-managed
+                  key: ledgerEpoch
             - name: ATENET_ROUTER_ADDR
               value: "atenet-router.ate-system.svc.cluster.local:80"
             - name: AX_SNAPSHOTS_BUCKET
-              value: "gs://dberkov-gke-dev3/ate-env/"
+              valueFrom:
+                configMapKeyRef:
+                  name: ax-managed
+                  key: ordinarySnapshotsBucket
           ports:
+            - containerPort: 8443
+              name: managed
             - containerPort: 8080
               name: http
           resources:
@@ -94,7 +113,7 @@ spec:
               memory: 1Gi
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8080
             initialDelaySeconds: 2
             periodSeconds: 5
@@ -105,6 +124,15 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           volumeMounts:
+            - name: managed-config
+              mountPath: /run/ax-managed
+              readOnly: true
+            - name: managed-tls
+              mountPath: /run/ax-tls
+              readOnly: true
+            - name: managed-client-ca
+              mountPath: /run/ax-client-ca
+              readOnly: true
             - mountPath: /var/run/secrets/ateapi
               name: ate-token
               readOnly: true
@@ -112,6 +140,15 @@ spec:
               name: servicedns-ca
               readOnly: true
       volumes:
+        - name: managed-config
+          configMap:
+            name: ax-managed
+        - name: managed-tls
+          secret:
+            secretName: ax-server-tls
+        - name: managed-client-ca
+          secret:
+            secretName: ax-client-ca
         - name: ate-token
           projected:
             defaultMode: 420
@@ -141,9 +178,11 @@ metadata:
     app.kubernetes.io/part-of: ax
 spec:
   ports:
+    - port: 8443
+      targetPort: 8443
+      name: managed
     - port: 8080
       targetPort: 8080
       name: http
   selector:
     app.kubernetes.io/name: ax-server
-
