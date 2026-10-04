@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-defaultBaseImage: cgr.dev/chainguard/static:latest
+# PATCH(local-env): gcr.io / cgr.dev unreachable; base image served from the
+# local plain-HTTP registry (mirrored docker.io/library/alpine:3.24 via 1ms.run).
+defaultBaseImage: 192.168.178.139:5000/library/alpine:3.24@sha256:d56c381f961d307a21b3ca004cf1e3910f106644aefb1f43e654c8a56c4fd395
 baseImageOverrides:
-  github.com/google/ax/cmd/ax-task-runner: alpine/git:latest
+  # PATCH(local-env): docker.io unreachable for ko; skipped building task-runner here.
+  github.com/google/ax/cmd/ax-task-runner: 192.168.178.139:5000/library/alpine:3.24@sha256:d56c381f961d307a21b3ca004cf1e3910f106644aefb1f43e654c8a56c4fd395
 builds:
   - id: ax-server
     main: ./cmd/ax-server
