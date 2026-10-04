@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"log/slog"
+	"strconv"
+	"strings"
 
 	pb "github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	ax "github.com/google/ax/pkg/apis/v1alpha1"
@@ -69,7 +72,7 @@ func (b *ManagedBackend) RecoverObserved(ctx context.Context, in RecoveryInput) 
 		if err != nil {
 			return out, err
 		}
-		if tag.GetMetadata().GetUid() == "" || in.BackendUID != "" && tag.Metadata.Uid != in.BackendUID || tag.GetScope() != pb.TagScope_TAG_SCOPE_ATESPACE || tag.GetStatus().GetSourceActorUid() != in.TaskUID || tag.GetStatus().GetActorTemplateUid() != in.RuntimeUID || tag.GetStatus().GetSnapshot().GetSnapshotUri() != observed.SnapshotURI || tag.GetStatus().GetSnapshot().GetContentScope() != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA {
+		if tag.GetMetadata().GetUid() == "" || in.BackendUID != "" && tag.Metadata.Uid != in.BackendUID || tag.GetScope() != pb.TagScope_TAG_SCOPE_ATESPACE || !proto.Equal(tag.GetSourceActor(), taskRef(in.Task)) || tag.GetStatus().GetActorTemplateUid() != in.RuntimeUID || tag.GetStatus().GetSnapshot().GetSnapshotUri() != observed.SnapshotURI || tag.GetStatus().GetSnapshot().GetContentScope() != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA {
 			return out, status.Error(codes.FailedPrecondition, "checkpoint evidence differs")
 		}
 		out.BackendUID = tag.Metadata.Uid
@@ -103,6 +106,7 @@ func (b *ManagedBackend) RecoverObserved(ctx context.Context, in RecoveryInput) 
 				return out, status.Error(codes.FailedPrecondition, "task restore source differs")
 			}
 			eg := proto.CloneOf(in.Runtime.Spec.Egress)
+			callbackPorts := map[string]int{}
 			if eg == nil {
 				eg = &ax.EgressSpec{}
 			}
@@ -123,16 +127,41 @@ func (b *ManagedBackend) RecoverObserved(ctx context.Context, in RecoveryInput) 
 				}
 				eg.Destinations = append(eg.Destinations, callback.Hostname())
 				eg.Credentials = append(eg.Credentials, &ax.EgressCredential{Hostname: callback.Hostname(), Header: ax.RuntimeCredentialHeader, SecretKeyRef: ref})
+				// PATCH(new-egress-schema): carry the callback port through,
+				// same as ManagedBackend.Egress.
+				if p := callback.Port(); p != "" {
+					if n, err := strconv.Atoi(p); err == nil && n > 0 && n < 65536 {
+						callbackPorts[strings.ToLower(callback.Hostname())] = n
+					}
+				}
 			}
-			desired, err := CompileEgress(in.Task.Metadata.Atespace, eg)
+			desired, err := CompileEgress(in.Task.Metadata.Atespace, eg, callbackPorts)
 			if err != nil {
 				return out, err
 			}
 			actual, err := b.Client.control.GetActorEgressPolicy(ctx, &pb.GetActorEgressPolicyRequest{Actor: taskRef(in.Task)})
 			if err != nil {
-				return out, err
+				// PATCH(recovery-install-egress): the stuck Create operations
+				// failed at exactly this step (the previous server build
+				// compiled rules under a stale schema the deployed substrate
+				// rejects), leaving the actor suspended with no policy and
+				// recovery dead-ended. Complete the original Create intent by
+				// installing the desired policy; this only ever runs from the
+				// offline, operator-fenced recovery procedure.
+				if status.Code(err) != codes.NotFound {
+					return out, err
+				}
+				if _, e := b.Client.control.CreateActorEgressPolicy(ctx, &pb.CreateActorEgressPolicyRequest{Actor: taskRef(in.Task), EgressPolicy: desired}); e != nil && status.Code(e) != codes.AlreadyExists {
+					return out, e
+				}
+				actual, err = b.Client.control.GetActorEgressPolicy(ctx, &pb.GetActorEgressPolicyRequest{Actor: taskRef(in.Task)})
+				if err != nil {
+					return out, err
+				}
 			}
 			if !proto.Equal(&pb.EgressPolicy{Rules: desired.Rules}, &pb.EgressPolicy{Rules: actual.Rules}) {
+				// PATCH(recovery-install-egress): debug aid for schema drift.
+				slog.Error("egress differs", "desired", desired.String(), "actual", actual.String())
 				return out, status.Error(codes.FailedPrecondition, "task egress installation is incomplete or differs")
 			}
 		}

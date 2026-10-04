@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -155,7 +156,7 @@ func (b *ManagedBackend) BuildRuntime(r *ax.PreparedRuntime, g *ax.TaskGroup) (*
 		ready = &ax.Readiness{Path: "/readyz", Port: port, TimeoutSeconds: 30}
 	}
 	container := &pb.Container{Name: "workload", Image: s.Image, Command: s.Command, Args: s.Args,
-		Readyz:       &pb.ContainerReadyz{HttpGet: &pb.HTTPGetAction{Path: ready.Path, Port: ready.Port}, TimeoutSeconds: ready.TimeoutSeconds},
+		WakeupProbe:  &pb.ContainerWakeupProbe{HttpGet: &pb.HTTPGetAction{Path: ready.Path, Port: ready.Port}, TimeoutSeconds: ready.TimeoutSeconds},
 		VolumeMounts: []*pb.VolumeMount{{Name: "data", MountPath: "/data"}, {Name: "trust", MountPath: trustMount}}}
 	for _, e := range s.Env {
 		container.Env = append(container.Env, &pb.EnvVar{Name: e.Name, Value: e.Value})
@@ -167,7 +168,7 @@ func (b *ManagedBackend) BuildRuntime(r *ax.PreparedRuntime, g *ax.TaskGroup) (*
 	tmpl := &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: r.Metadata.Atespace, Name: runtimeName(r)},
 		WorkerSelector: &pb.Selector{MatchLabels: map[string]string{GroupLabel: g.Metadata.Uid}},
 		Containers:     []*pb.Container{container}, SandboxConfig: &pb.SandboxConfig{SandboxClass: class, ConfigName: config},
-		SnapshotsConfig: &pb.SnapshotsConfig{StorageLocation: location, OnPause: pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, OnCommit: pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA, OnResume: &pb.OnResumeConfig{FromData: pb.ResumeSource_RESUME_SOURCE_GOLDEN}},
+		SnapshotConfig: &pb.SnapshotConfig{OnPause: pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, OnCommit: pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA, OnResume: &pb.OnResumeConfig{FromData: pb.ResumeSource_RESUME_SOURCE_GOLDEN}, StorageLocation: location},
 		Volumes:         []*pb.Volume{{Name: "data", DurableDir: &pb.DurableDirVolumeSource{}}, {Name: "trust", SystemInfo: &pb.SystemInfoVolumeSource{DataSources: []*pb.SystemInfoDataSource{{TrustBundle: &pb.TrustBundleDataSource{Name: "egress-mitm.ate.dev", Path: "ca.pem"}}}}}}}
 	if s.Kind == "Sandbox" {
 		if !strings.Contains(b.GuestImage, "@sha256:") {
@@ -250,14 +251,25 @@ func observe(a *pb.Actor) Observation {
 		phase = "Unknown"
 	}
 	snapshot := a.GetStatus().GetExternalSnapshot()
-	return Observation{UID: a.GetMetadata().GetUid(), Phase: phase, TemplateUID: a.GetStatus().GetCurrentActorTemplateUid(), SnapshotURI: snapshot.GetSnapshotUri(), Data: snapshot.GetContentScope() == pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA}
+	// PATCH(new-egress-schema): ActorStatus no longer carries the actor
+	// template UID (Actor.actor_template is a name-only ObjectRef now).
+	// Callers that need template lineage resolve it via b.Observe.
+	return Observation{UID: a.GetMetadata().GetUid(), Phase: phase, SnapshotURI: snapshot.GetSnapshotUri(), Data: snapshot.GetContentScope() == pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA}
 }
 func (b *ManagedBackend) Observe(ctx context.Context, t *ax.Task) (Observation, error) {
 	a, err := b.Client.GetActor(ctx, t.Metadata.Atespace, taskName(t))
 	if err != nil {
 		return Observation{}, err
 	}
-	return observe(a), nil
+	o := observe(a)
+	// PATCH(new-egress-schema): resolve the actor template UID through the
+	// template ref; Checkpoint lineage checks still need it.
+	if name := a.GetActorTemplate().GetName(); name != "" {
+		if tmpl, err := b.Client.GetActorTemplate(ctx, a.GetActorTemplate().GetAtespace(), name); err == nil {
+			o.TemplateUID = tmpl.GetMetadata().GetUid()
+		}
+	}
+	return o, nil
 }
 func (b *ManagedBackend) Create(ctx context.Context, t *ax.Task, r *ax.PreparedRuntime, c *ax.TaskCheckpoint, token string) (Observation, error) {
 	a := &pb.Actor{Metadata: &pb.ResourceMetadata{Atespace: t.Metadata.Atespace, Name: taskName(t)}, ActorTemplate: &pb.ObjectRef{Atespace: r.Metadata.Atespace, Name: runtimeName(r)}}
@@ -336,6 +348,7 @@ func (b *ManagedBackend) Egress(ctx context.Context, t *ax.Task, r *ax.PreparedR
 	if r.Spec.GetEgress() != nil {
 		eg = proto.Clone(r.Spec.Egress).(*ax.EgressSpec)
 	}
+	portsByHost := map[string]int{}
 	if r.Spec.Kind == "Service" {
 		u, err := url.Parse(b.CallbackURL)
 		if err != nil || u.Scheme != "https" || u.Hostname() == "" {
@@ -347,16 +360,31 @@ func (b *ManagedBackend) Egress(ctx context.Context, t *ax.Task, r *ax.PreparedR
 		}
 		eg.Destinations = append(eg.Destinations, u.Hostname())
 		eg.Credentials = append(eg.Credentials, &ax.EgressCredential{Hostname: u.Hostname(), Header: ax.RuntimeCredentialHeader, SecretKeyRef: secret})
+		// PATCH(new-egress-schema): the callback may live on a non-standard
+		// HTTPS port (kagent runs its controller on 8083). The new substrate
+		// egress schema matches ports per rule, so carry the callback port
+		// through instead of relying on the old any-port hostname match.
+		if p := u.Port(); p != "" {
+			if n, err := strconv.Atoi(p); err == nil && n > 0 && n < 65536 {
+				portsByHost[strings.ToLower(u.Hostname())] = n
+			}
+		}
 	}
-	return CompileEgress(t.Metadata.Atespace, eg)
+	return CompileEgress(t.Metadata.Atespace, eg, portsByHost)
 }
-func CompileEgress(space string, s *ax.EgressSpec) (*pb.EgressPolicy, error) {
+// PATCH(new-egress-schema): the deployed substrate replaced the old
+// hostnames/cidrs/all EgressRule union with protocol-scoped rules
+// (http/https/tls_passthrough), per-rule Ports, and
+// HttpRuleEffects.ReplaceHeaders (formerly EgressRuleEffects.InjectStaticHeaders).
+// Agent runtimes speak HTTPS (MITM-intercepted by the egress gateway, which is
+// also what injects their credentials), so destinations compile to HTTPSRule
+// entries. IP-literal destinations have no equivalent matcher in the new
+// schema and are rejected explicitly instead of silently failing validation.
+func CompileEgress(space string, s *ax.EgressSpec, portsByHost map[string]int) (*pb.EgressPolicy, error) {
 	hosts := map[string]bool{}
-	var cidrs []string
 	for _, d := range s.GetDestinations() {
-		if ip, err := netip.ParseAddr(d); err == nil {
-			cidrs = append(cidrs, netip.PrefixFrom(ip.Unmap(), ip.Unmap().BitLen()).String())
-			continue
+		if _, err := netip.ParseAddr(d); err == nil {
+			return nil, status.Error(codes.InvalidArgument, "IP-literal egress destinations are not supported by the deployed substrate egress schema; use hostnames")
 		}
 		d = strings.TrimSuffix(strings.ToLower(d), ".")
 		if d == "" || strings.ContainsAny(d, " /:*\\") {
@@ -364,7 +392,7 @@ func CompileEgress(space string, s *ax.EgressSpec) (*pb.EgressPolicy, error) {
 		}
 		hosts[d] = true
 	}
-	rules := map[string]*pb.HostnameRule{}
+	rules := map[string]*pb.HTTPSRule{}
 	seen := map[string]bool{}
 	for _, c := range s.GetCredentials() {
 		host := strings.ToLower(c.Hostname)
@@ -376,11 +404,11 @@ func CompileEgress(space string, s *ax.EgressSpec) (*pb.EgressPolicy, error) {
 		seen[host+"/"+header] = true
 		rule := rules[host]
 		if rule == nil {
-			rule = &pb.HostnameRule{Patterns: []string{host}, Effects: &pb.EgressRuleEffects{}}
+			rule = &pb.HTTPSRule{Hostnames: []string{host}, Effects: &pb.HttpRuleEffects{}}
 			rules[host] = rule
 		}
-		rule.Effects.InjectStaticHeaders = append(rule.Effects.InjectStaticHeaders, &pb.CredentialHeaderInjection{Header: header, Prefix: c.Prefix, CredentialUri: fmt.Sprintf("ate-secret://k8s.io/default/%s/%s/%s", ref.Namespace, ref.Name, ref.Key)})
-		if len(rule.Effects.InjectStaticHeaders) > 16 {
+		rule.Effects.ReplaceHeaders = append(rule.Effects.ReplaceHeaders, &pb.CredentialHeader{Header: header, Prefix: c.Prefix, CredentialUri: fmt.Sprintf("ate-secret://k8s.io/default/%s/%s/%s", ref.Namespace, ref.Name, ref.Key)})
+		if len(rule.Effects.ReplaceHeaders) > 16 {
 			return nil, status.Error(codes.InvalidArgument, "too many credential headers")
 		}
 	}
@@ -391,19 +419,30 @@ func CompileEgress(space string, s *ax.EgressSpec) (*pb.EgressPolicy, error) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		result.Rules = append(result.Rules, &pb.EgressRule{Hostnames: rules[k]})
+		rule := rules[k]
+		// PATCH(new-egress-schema): substrate materializes the default HTTPS
+		// port on read-back; set it explicitly so re-read comparisons match.
+		rule.Ports = &pb.Ports{Numbers: []int32{443}}
+		if p, ok := portsByHost[k]; ok {
+			rule.Ports = &pb.Ports{Numbers: []int32{int32(p)}}
+		}
+		result.Rules = append(result.Rules, &pb.EgressRule{Https: rule})
 	}
+	// PATCH(new-egress-schema): the new schema forbids a hostname from
+	// matching two rules on the same port ("ties" validation), so the
+	// catch-all plain rule must exclude hosts already matched by their
+	// credential rule above.
 	keys = nil
 	for k := range hosts {
+		if _, covered := rules[k]; covered {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	if len(keys) > 0 {
-		result.Rules = append(result.Rules, &pb.EgressRule{Hostnames: &pb.HostnameRule{Patterns: keys}})
-	}
-	if len(cidrs) > 0 {
-		sort.Strings(cidrs)
-		result.Rules = append(result.Rules, &pb.EgressRule{Cidrs: &pb.CIDRRule{Cidrs: cidrs}})
+		// PATCH(new-egress-schema): explicit default port, same as above.
+		result.Rules = append(result.Rules, &pb.EgressRule{Https: &pb.HTTPSRule{Hostnames: keys, Ports: &pb.Ports{Numbers: []int32{443}}}})
 	}
 	if len(result.Rules) > 256 {
 		return nil, status.Error(codes.InvalidArgument, "too many egress rules")
@@ -448,7 +487,10 @@ func (b *ManagedBackend) Checkpoint(ctx context.Context, t *ax.Task, expectedUID
 	if err != nil {
 		return "", err
 	}
-	if tag.GetStatus().GetSourceActorUid() != expectedUID || tag.GetStatus().GetActorTemplateUid() != before.TemplateUID || tag.GetStatus().GetSnapshot().GetSnapshotUri() == "" || tag.GetStatus().GetSnapshot().GetContentScope() != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA {
+	// PATCH(new-egress-schema): Tag.source_actor is a name-only ObjectRef now;
+	// the source-actor identity is already pinned by `before.UID == expectedUID`
+	// above, so the ref comparison only guards against a tag from another task.
+	if !proto.Equal(tag.GetSourceActor(), taskRef(t)) || tag.GetStatus().GetActorTemplateUid() != before.TemplateUID || tag.GetStatus().GetSnapshot().GetSnapshotUri() == "" || tag.GetStatus().GetSnapshot().GetContentScope() != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA {
 		return tag.GetMetadata().GetUid(), status.Error(codes.FailedPrecondition, "checkpoint lineage or data snapshot differs")
 	}
 	after, err := b.Observe(ctx, t)
